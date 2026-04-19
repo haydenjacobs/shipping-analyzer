@@ -41,7 +41,7 @@ yarn-error.log*
 next-env.d.ts
 
 # database
-db/
+/db/
 *.db
 
 # test fixtures (regenerated locally via scripts/build-test-fixtures.ts)

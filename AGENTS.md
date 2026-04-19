@@ -75,9 +75,12 @@ Analysis
 ├── shareable_token (for public view links, nullable)
 ├── view_mode (enum: "optimized" | "single_node", default "optimized")
 │   └── Saved per-analysis; determines default mode when results page loads.
-├── excluded_locations (JSON, nullable)
-│   └── Map of { providerName: [warehouseId, ...] } for locations the user has
-│       unchecked in Optimized mode. Default: empty (all locations included).
+├── excluded_locations (JSON text, NOT NULL, default '[]')
+│   └── JSON array of warehouse IDs excluded from Optimized-mode aggregation.
+│       Stored as text because SQLite has no native array type; code parses on
+│       read. NOT NULL with a default of '[]' simplifies every call site (no
+│       null-handling required). If v2 needs relational integrity on this
+│       (e.g. "which analyses exclude warehouse X"), promote to a join table.
 ├── projected_order_count (integer, nullable)
 │   └── User-entered forecast volume. Drives the "Projected Period Cost" column.
 └── projected_period (enum: "month" | "year", default "year")
@@ -96,7 +99,7 @@ Warehouse
 ├── origin_zip3 (first 3 digits, derived)
 ├── dim_weight_enabled (boolean, default false)
 ├── dim_factor (integer, nullable — e.g., 139)
-├── surcharge_flat (decimal, default 0.00 — e.g., 2.50 for residential)
+├── surcharge_flat_cents (integer cents, default 0 — e.g., 250 for $2.50 residential)
 └── notes (text, nullable)
 
 RateCard
@@ -112,10 +115,10 @@ RateCard
 RateCardEntry
 ├── id
 ├── rate_card_id (foreign key)
-├── weight_value (integer — e.g., 7 for 7oz or 3 for 3lbs)
+├── weight_value (real — e.g., 7 for 7oz or 3 for 3lbs; real supports decimal tiers like 15.99 oz)
 ├── weight_unit (enum: "oz" | "lbs")
 ├── zone (integer, 1-8)
-└── price (decimal)
+└── price_cents (integer cents — e.g., 419 for $4.19)
 
 ZoneMap (static reference data, pre-seeded from USPS)
 ├── origin_zip3 (text, e.g., "531")
@@ -143,11 +146,26 @@ OrderResult (calculated, per order per warehouse)
 ├── billable_weight_unit (enum: "oz" | "lbs")
 ├── dim_weight_lbs (decimal, nullable)
 ├── rate_card_id (foreign key — which rate card was used)
-├── base_cost (decimal)
-├── surcharge (decimal)
-├── total_cost (decimal — base_cost + surcharge)
+├── base_cost_cents (integer cents)
+├── surcharge_cents (integer cents)
+├── total_cost_cents (integer cents — base_cost_cents + surcharge_cents)
 └── calculation_notes (text, nullable — for debugging/auditing)
+
+ExcludedOrder (validation failures — replaces is_valid/error_reason columns)
+├── id
+├── order_id (foreign key)
+├── warehouse_id (foreign key, nullable)
+│   └── Null when the order is excluded from the ENTIRE analysis (consistency
+│       rule: if invalid for any warehouse, excluded from all). Populated when
+│       identifying the specific warehouse that triggered the exclusion, for
+│       the audit CSV download.
+├── reason (text — e.g., "zone_not_found", "weight_exceeds_rate_card_max")
+└── details (text, nullable — human-readable context)
 ```
+
+### Money representation
+
+**All monetary values are stored as integer cents**, not decimals. Column names use the `_cents` suffix (`surcharge_flat_cents`, `price_cents`, `base_cost_cents`, `surcharge_cents`, `total_cost_cents`). This avoids floating-point drift when summing or averaging thousands of order costs — a real hazard given the engine aggregates across entire order files. UI and exports format cents → dollars at render time.
 
 ### Notes on the data model
 
@@ -156,6 +174,8 @@ OrderResult (calculated, per order per warehouse)
 **Optimized-mode winner is derived, not stored.** The "winning warehouse" for each order in Optimized mode is a function of (a) the `OrderResult` matrix and (b) the current `excluded_locations` state. It is computed on demand rather than persisted. If a user toggles a checkbox, the winner can change; persisting it would be a source of drift. The engine module that produces summary aggregates exposes a pure function for this: given the matrix and a set of excluded warehouse IDs, return per-order winners for each provider.
 
 **`provider_name` is a flat string, not a foreign key.** For V1, warehouses are grouped by matching `provider_name` within an analysis. There is no separate `Provider` table. If V2 needs 3PL-level metadata (contracts, contacts, historical performance), a `Provider` table can be introduced without breaking the existing data.
+
+**Excluded orders live in their own table, not as flag columns.** The `ExcludedOrder` table (see Core Entities above) records any order that fails Step 1 validation or Step 3/4 rate card limits, with a reason code. This keeps `OrderResult` as the "these costs are real" source of truth and provides a clean query surface for the Excluded-Orders Download (a standalone CSV accessible from the Results view).
 
 ---
 
@@ -572,88 +592,95 @@ These features are planned for later. v1 code should not block these additions.
 
 ## File & Folder Structure
 
+**Top-level layout (no `src/` wrapper).** All source roots (`app/`, `lib/`, `components/`, `types/`) live at the repo root. This matches the scaffold Next.js produced and keeps import paths shorter.
+
+**Next.js config is TypeScript (`next.config.ts`), not `next.config.js`** — current Next.js conventions.
+
+**No `tailwind.config.js`.** The project uses Tailwind CSS v4, which configures via `@theme` directives inside CSS rather than a standalone JS config file.
+
+**Drizzle migrations are tracked in Git.** The `lib/db/migrations/` directory contains generated SQL. Workflow: edit `lib/db/schema.ts` → `npm run db:generate` → review diff → `npm run db:migrate`. Never hand-edit migration SQL files.
+
 ```
 /shipping-analyzer
-├── src/
-│   ├── app/                    # Next.js App Router pages
-│   │   ├── page.tsx            # Dashboard
-│   │   ├── analysis/
-│   │   │   ├── [id]/
-│   │   │   │   ├── page.tsx    # Analysis workspace
-│   │   │   │   └── results/
-│   │   │   │       └── page.tsx
-│   │   │   └── new/
+├── app/                      # Next.js App Router pages
+│   ├── page.tsx              # Dashboard
+│   ├── analysis/
+│   │   ├── [id]/
+│   │   │   ├── page.tsx      # Analysis workspace
+│   │   │   └── results/
 │   │   │       └── page.tsx
-│   │   ├── share/
-│   │   │   └── [token]/
-│   │   │       └── page.tsx    # Public shareable results
-│   │   └── api/
-│   │       ├── analyses/
-│   │       ├── warehouses/
-│   │       ├── orders/
-│   │       ├── rate-cards/
-│   │       ├── zones/
-│   │       ├── calculate/
-│   │       └── export/         # Summary + per-order CSV/Excel generation
-│   ├── lib/
-│   │   ├── db/
-│   │   │   ├── schema.ts       # Drizzle schema definitions
-│   │   │   ├── index.ts        # DB connection
-│   │   │   └── migrations/
-│   │   ├── engine/
-│   │   │   ├── zone-lookup.ts
-│   │   │   ├── weight-calc.ts
-│   │   │   ├── rate-lookup.ts
-│   │   │   ├── surcharge.ts
-│   │   │   ├── aggregation.ts      # Step 6 — per-warehouse aggregates
-│   │   │   ├── optimized.ts        # Step 7 — provider grouping + winner selection (pure function)
-│   │   │   └── index.ts            # Orchestrates full calculation
-│   │   ├── parsers/
-│   │   │   ├── order-parser.ts
-│   │   │   ├── rate-card-parser.ts
-│   │   │   └── zone-chart-parser.ts  # For advanced manual override only
-│   │   ├── export/
-│   │   │   ├── summary-export.ts       # Builds summary rows + header block
-│   │   │   ├── per-order-export.ts     # Builds wide per-order table
-│   │   │   ├── csv-writer.ts
-│   │   │   └── xlsx-writer.ts          # SheetJS multi-tab workbook
-│   │   └── utils/
-│   │       └── zip.ts          # ZIP code normalization, etc.
-│   ├── components/
-│   │   ├── ui/                 # Reusable UI primitives
-│   │   ├── dashboard/
-│   │   ├── analysis/
-│   │   ├── upload/
-│   │   └── results/
-│   │       ├── HeaderStatsBar.tsx
-│   │       ├── ModeToggle.tsx
-│   │       ├── SummaryTable.tsx
-│   │       ├── ProviderRow.tsx           # Optimized-mode expandable row
-│   │       ├── LocationSubRow.tsx        # Checkbox + location detail
-│   │       ├── NodeUtilizationStrip.tsx  # Inline utilization summary
-│   │       └── ExportButtons.tsx
-│   └── types/
-│       └── index.ts            # Shared TypeScript types
+│   │   └── new/
+│   │       └── page.tsx
+│   ├── share/
+│   │   └── [token]/
+│   │       └── page.tsx      # Public shareable results
+│   └── api/
+│       ├── analyses/
+│       ├── warehouses/
+│       ├── orders/
+│       ├── rate-cards/
+│       ├── zones/
+│       ├── calculate/
+│       └── export/           # Summary + per-order CSV/Excel generation
+├── lib/
+│   ├── db/
+│   │   ├── schema.ts         # Drizzle schema definitions
+│   │   ├── index.ts          # DB connection (no initDb; migrations handle schema)
+│   │   └── migrations/       # Generated by drizzle-kit; tracked in Git
+│   ├── engine/
+│   │   ├── zone-lookup.ts
+│   │   ├── weight-calc.ts
+│   │   ├── rate-lookup.ts
+│   │   ├── surcharge.ts
+│   │   ├── aggregation.ts    # Step 6 — per-warehouse aggregates
+│   │   ├── optimized.ts      # Step 7 — provider grouping + winner selection (pure function)
+│   │   └── index.ts          # Orchestrates full calculation
+│   ├── parsers/
+│   │   ├── order-parser.ts
+│   │   ├── rate-card-parser.ts
+│   │   └── zone-chart-parser.ts  # For advanced manual override only
+│   ├── export/
+│   │   ├── summary-export.ts     # Builds summary rows + header block
+│   │   ├── per-order-export.ts   # Builds wide per-order table
+│   │   ├── csv-writer.ts
+│   │   └── xlsx-writer.ts        # SheetJS multi-tab workbook
+│   └── utils/
+│       └── zip.ts            # ZIP code normalization, etc.
+├── components/
+│   ├── ui/                   # Reusable UI primitives
+│   ├── dashboard/
+│   ├── analysis/
+│   ├── upload/
+│   └── results/
+│       ├── HeaderStatsBar.tsx
+│       ├── ModeToggle.tsx
+│       ├── SummaryTable.tsx
+│       ├── ProviderRow.tsx             # Optimized-mode expandable row
+│       ├── LocationSubRow.tsx          # Checkbox + location detail
+│       ├── NodeUtilizationStrip.tsx    # Inline utilization summary
+│       └── ExportButtons.tsx
+├── types/
+│   └── index.ts              # Shared TypeScript types
 ├── scripts/
-│   └── seed-zones.ts           # One-time USPS zone data seeder
+│   ├── seed-zones.ts         # One-time USPS zone data seeder
+│   └── migrate.ts            # Runs Drizzle migrations (npm run db:migrate)
 ├── tests/
 │   ├── engine/
 │   │   ├── weight-calc.test.ts
 │   │   ├── zone-lookup.test.ts
 │   │   ├── rate-lookup.test.ts
-│   │   ├── optimized.test.ts   # Step 7: grouping, winner selection, utilization, edge cases
-│   │   └── integration.test.ts # End-to-end calc with known data
+│   │   ├── optimized.test.ts       # Step 7: grouping, winner selection, utilization, edge cases
+│   │   └── integration.test.ts     # End-to-end calc with known data
 │   └── parsers/
 ├── data/
-│   └── zone-seeds/             # Reserved for any manual zone overrides
+│   └── zone-seeds/           # Reserved for any manual zone overrides
 ├── db/
-│   └── shipping-analyzer.db    # SQLite database file (gitignored)
+│   └── shipping-analyzer.db  # SQLite database file (gitignored; entire /db/ gitignored)
 ├── drizzle.config.ts
-├── next.config.js
-├── tailwind.config.js
+├── next.config.ts            # Next.js config (TypeScript, not .js)
 ├── tsconfig.json
-├── package.json
-├── BACKLOG.md                  # Deferred features and improvements
+├── package.json              # Scripts: dev, build, test, seed-zones, db:generate, db:migrate, db:studio
+├── BACKLOG.md                # Deferred features and improvements
 └── README.md
 ```
 
