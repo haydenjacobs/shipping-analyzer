@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# database
+db/
+*.db
+
+# test fixtures (regenerated locally via scripts/build-test-fixtures.ts)
+tests/fixtures/
