@@ -16,6 +16,19 @@ export interface ParsedSection {
   sourceRowEnd: number
 }
 
+/** Convert a dollar price (e.g. 4.19) to integer cents (419). Rounds to the
+ * nearest cent. Returns null for null/NaN. Use at the DB insert boundary so the
+ * stored rate_card_entries.price_cents matches the money integer convention. */
+export function dollarsToCents(dollars: number | null | undefined): number | null {
+  if (dollars == null || !Number.isFinite(dollars)) return null
+  return Math.round(dollars * 100)
+}
+
+/** Convenience: the ParsedSection prices[][] matrix mapped to integer cents. */
+export function sectionPricesInCents(section: ParsedSection): (number | null)[][] {
+  return section.prices.map(row => row.map(dollarsToCents))
+}
+
 export interface ParserOutput {
   sections: ParsedSection[]
   warnings: string[]
@@ -171,7 +184,7 @@ function extractSectionsFromAnchor(
   let currentAnchorRow = anchor.rowIdx
   let currentUnitLabel = anchorUnitHint
   let currentDataRows: Array<{ rowIdx: number; weight: number; prices: (number | null)[] }> = []
-  let currentIgnoredCols = ignoredCols
+  const currentIgnoredCols = ignoredCols
   let lastWeight: number | null = null
 
   function flushSection() {

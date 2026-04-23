@@ -4,7 +4,10 @@ import * as schema from './schema'
 import path from 'path'
 import fs from 'fs'
 
-const DB_PATH = path.join(process.cwd(), 'db', 'shipping-analyzer.db')
+// Allow tests (and future deployment scenarios) to point at a different file.
+// Defaults to ./db/shipping-analyzer.db inside the project.
+const DB_PATH = process.env.SHIPPING_ANALYZER_DB_PATH
+  || path.join(process.cwd(), 'db', 'shipping-analyzer.db')
 
 // Ensure db/ directory exists before opening the file. Drizzle's migrator
 // creates the schema itself — no CREATE TABLE statements belong here.

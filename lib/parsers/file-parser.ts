@@ -55,8 +55,13 @@ export class FileParseError extends Error {
 /**
  * Parse a ParseFilePayload (CSV text or Excel base64) into a structured grid
  * plus header + row-object view. Throws FileParseError on bad input.
+ *
+ * @param skipHeaderValidation - Skip the column-header checks. Use this for
+ *   files (e.g. rate cards) whose first row is not a traditional header row.
+ *   The `headers` and `rows` fields are still populated from row 0, but no
+ *   error is thrown if that row is empty or looks like merged cells.
  */
-export function parseFilePayload(payload: ParseFilePayload): ParsedFile {
+export function parseFilePayload(payload: ParseFilePayload, { skipHeaderValidation = false } = {}): ParsedFile {
   const { fileType, data, filename = `upload.${fileType === 'excel' ? 'xlsx' : 'csv'}` } = payload
   if (!data) throw new FileParseError('No file data provided')
 
@@ -79,7 +84,7 @@ export function parseFilePayload(payload: ParseFilePayload): ParsedFile {
   }
 
   const headers = grid[0].map(h => (h ?? '').trim())
-  validateHeaders(headers, filename)
+  if (!skipHeaderValidation) validateHeaders(headers, filename)
 
   const rows: Record<string, string>[] = []
   for (let r = 1; r < grid.length; r++) {

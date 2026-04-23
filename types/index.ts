@@ -1,31 +1,40 @@
 export type WeightUnitMode = 'oz_only' | 'lbs_only' | 'oz_then_lbs'
 export type WeightUnit = 'oz' | 'lbs'
 export type AnalysisStatus = 'draft' | 'complete'
+export type ViewMode = 'optimized' | 'single_node'
+export type ProjectedPeriod = 'month' | 'year'
 
-export interface Tpl {
+// ─── Core entities ─────────────────────────────────────────────────────────────
+
+export interface Analysis {
+  id: number
+  name: string
+  createdAt: string
+  updatedAt: string
+  status: AnalysisStatus
+  shareableToken: string | null
+  viewMode: ViewMode
+  excludedLocations: number[] // parsed from stored JSON text
+  projectedOrderCount: number | null
+  projectedPeriod: ProjectedPeriod
+}
+
+export interface Warehouse {
   id: number
   analysisId: number
-  name: string
-  multiNodeEnabled: boolean
+  providerName: string
+  locationLabel: string
+  originZip: string
+  originZip3: string
   dimWeightEnabled: boolean
   dimFactor: number | null
   surchargeFlatCents: number
   notes: string | null
-  createdAt: string
-}
-
-export interface Location {
-  id: number
-  tplId: number
-  name: string
-  originZip: string
-  originZip3: string
-  createdAt: string
 }
 
 export interface RateCard {
   id: number
-  tplId: number
+  warehouseId: number
   name: string
   weightUnitMode: WeightUnitMode
 }
@@ -54,28 +63,23 @@ export interface Order {
 
 export interface OrderResult {
   orderId: number
-  locationId: number
-  tplId: number
-  zone: number | null
-  billableWeightValue: number | null
-  billableWeightUnit: WeightUnit | null
+  warehouseId: number
+  zone: number
+  billableWeightValue: number
+  billableWeightUnit: WeightUnit
   dimWeightLbs: number | null
-  rateCardId: number | null
-  baseCostCents: number | null
-  surchargeCents: number | null
-  totalCostCents: number | null
-  isValid: boolean
-  errorReason: string | null
+  rateCardId: number
+  baseCostCents: number
+  surchargeCents: number
+  totalCostCents: number
   calculationNotes: string | null
 }
 
-export interface OrderBestResult {
-  id: number
+export interface ExcludedOrder {
   orderId: number
-  tplId: number
-  bestLocationId: number
-  bestRateCardId: number
-  bestTotalCostCents: number
+  warehouseId: number | null
+  reason: string
+  details: string | null
 }
 
 // ─── Engine input types ────────────────────────────────────────────────────────
@@ -85,54 +89,64 @@ export interface RateCardWithEntries {
   entries: RateCardEntry[]
 }
 
-export interface LocationInput {
-  location: Location
-  zoneMaps: Map<string, number> // destZip3 → zone for this location's origin_zip3
-}
-
-export interface TplInput {
-  tpl: Tpl
-  locations: LocationInput[]
+export interface WarehouseInput {
+  warehouse: Warehouse
+  // destZip3 → zone for this warehouse's origin_zip3
+  zoneMaps: Map<string, number>
+  // v1: exactly one card per warehouse is typical, but engine tolerates many
+  // by picking the cheapest rate card per order per warehouse.
   rateCards: RateCardWithEntries[]
 }
 
 export interface EngineInput {
   orders: Order[]
-  tpls: TplInput[]
+  warehouses: WarehouseInput[]
 }
 
 // ─── Engine output types ───────────────────────────────────────────────────────
 
-export interface LocationSummary {
-  locationId: number
-  locationName: string
+export interface WarehouseSummary {
+  warehouseId: number
+  providerName: string
+  locationLabel: string
   originZip3: string
   orderCount: number
   totalCostCents: number
   avgCostCents: number
+  avgZone: number
   zoneDistribution: Record<number, number>
+  avgCostByZone: Record<number, number>
 }
 
-export interface TplSummary {
-  tplId: number
-  tplName: string
-  multiNodeEnabled: boolean
+export interface OptimizedWinner {
+  orderId: number
+  winningWarehouseId: number
+  winningCostCents: number
+  winningZone: number
+}
+
+export interface ProviderOptimizedSummary {
+  providerName: string
+  includedWarehouseIds: number[]
+  totalWarehouseCount: number
   orderCount: number
   totalCostCents: number
   avgCostCents: number
-  zoneDistribution: Record<number, number>
-  avgCostByZone: Record<number, number>
-  locationSummaries: LocationSummary[]
+  avgZone: number
+  // warehouseId → fraction of winning orders (0..1). Excluded warehouses: 0.
+  nodeUtilization: Record<number, number>
+  winners: OptimizedWinner[]
 }
 
 export interface EngineOutput {
   orderResults: OrderResult[]
-  orderBestResults: Array<Omit<OrderBestResult, 'id'>>
-  tplSummaries: TplSummary[]
+  warehouseSummaries: WarehouseSummary[]
+  excludedOrders: ExcludedOrder[]
   includedOrderIds: number[]
-  excludedOrders: Array<{ orderId: number; orderNumber: string; reason: string }>
   warnings: string[]
 }
+
+// ─── Parser types ──────────────────────────────────────────────────────────────
 
 export interface ParsedRateCardRow {
   weight_value: number

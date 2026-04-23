@@ -177,6 +177,8 @@ ExcludedOrder (validation failures — replaces is_valid/error_reason columns)
 
 **Excluded orders live in their own table, not as flag columns.** The `ExcludedOrder` table (see Core Entities above) records any order that fails Step 1 validation or Step 3/4 rate card limits, with a reason code. This keeps `OrderResult` as the "these costs are real" source of truth and provides a clean query surface for the Excluded-Orders Download (a standalone CSV accessible from the Results view).
 
+**Rate cards attach to warehouses in the schema but are presented as provider-level in the UI.** Upload and re-upload fan out to every location in the provider group; new locations inherit the existing rate card via a server-side copy. This keeps the schema flexible for v2 (where a specific DC might need an overridden rate card) while matching the mental model that 3PLs quote at the network level. If per-location overrides become a real use case in v2, consider promoting rate cards to a shared entity (e.g., `provider_rate_cards`) with a warehouse-level override table — but do not add this complexity in v1.
+
 ---
 
 ## Core Business Logic — THE CALCULATION ENGINE
@@ -360,19 +362,40 @@ Determinism requirement:
 
 ## Rate Card Upload Format
 
-Rate cards will be uploaded as CSV or Excel. The expected format after parsing:
+Rate cards are uploaded as CSV or Excel. The parser (`lib/parsers/rate-card-parser.ts`) is a
+format-tolerant scanner — it finds the zone header row by looking for cells containing bare
+integers 1–8 (or "Zone 1" / "Z1" patterns), then reads the weight column immediately to the
+left of the leftmost zone column. Extra header rows, branding text, and blank rows above the
+zone header are ignored.
 
-**Standard template the user pastes rate card data into:**
+**Minimum working format (CSV):**
 
-| weight_value | weight_unit | zone_1 | zone_2 | zone_3 | zone_4 | zone_5 | zone_6 | zone_7 | zone_8 |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | oz | 4.19 | 4.26 | 4.28 | 4.39 | 4.45 | 4.55 | 4.64 | 4.83 |
-| 2 | oz | 4.19 | 4.26 | 4.28 | 4.39 | 4.45 | 4.55 | 4.64 | 4.83 |
-| ... | | | | | | | | | |
-| 16 | oz | 5.66 | 5.72 | 5.84 | 6.14 | 6.66 | 6.81 | 7.00 | 7.29 |
-| 1 | lbs | 5.36 | 5.42 | 5.52 | 5.80 | 6.31 | 6.50 | 7.77 | 8.25 |
-| 2 | lbs | 5.48 | 5.58 | 5.68 | 6.09 | 6.75 | 7.12 | 8.20 | 8.35 |
-| ... up to 100+ lbs | | | | | | | | | |
+```
+oz,1,2,3,4,5,6,7,8
+1,4.19,4.26,4.28,4.39,4.45,4.55,4.64,4.83
+2,4.19,4.26,4.28,4.39,4.45,4.55,4.64,4.83
+...
+16,5.66,5.72,5.84,6.14,6.66,6.81,7.00,7.29
+lbs,1,2,3,4,5,6,7,8
+1,5.36,5.42,5.52,5.80,6.31,6.50,7.77,8.25
+2,5.48,5.58,5.68,6.09,6.75,7.12,8.20,8.35
+...
+```
+
+The first column of the zone-header rows ("oz", "lbs") provides the unit label for that section.
+Prices may include `$` signs and commas — the parser strips them. The parser also accepts the
+native carrier export format (e.g., rows with "Oz" and "Lbs" section headers, extra label
+columns, Alaska/Hawaii columns which are ignored).
+
+**Important:** column headers like `zone_1`, `zone_2` (with underscores) are NOT recognized.
+Zone headers must be bare integers (`1`–`8`), `Zone 1`–`Zone 8`, or `Z1`–`Z8`.
+
+The upload process:
+1. Accepts CSV or Excel (.xlsx / .xls)
+2. Validates that zone columns 1–8 are present
+3. Validates that prices are numeric and positive
+4. Flags any gaps (missing zone columns, missing weight rows)
+5. Shows a preview before confirming the import
 
 The upload process should:
 1. Accept CSV or Excel
@@ -439,25 +462,28 @@ Orders come from client OMS exports and vary in format. The upload flow:
 - Click an analysis to open it
 
 ### Analysis Builder (main workspace)
-- **Header:** Analysis name (editable), created date
-- **Left panel or tabs:**
-  1. **Orders** — upload order data, see row count, preview data
-  2. **Warehouses** — add/remove warehouses, each with:
-     - **Provider Name** (required — the 3PL brand; shared across locations)
-     - Location label
-     - Origin ZIP
-     - Rate card upload (with weight unit mode selector, preview)
-     - Dim weight toggle + dim factor input
-     - Flat surcharge input
-     - Zone data: pre-seeded (with option to override via advanced settings)
+- **Header:** Analysis name (editable), status badge
+- **Left sidebar with vertical tabs:**
+  1. **Orders** — upload order data, see row count, preview first 50 rows. Column mapping UI auto-detects likely headers; user confirms before import. Shows "X of Y imported, Z failed" with downloadable failures CSV.
+  2. **Providers** — add/remove providers and their locations. Rate cards are a **provider-level concept** in the UI (see below).
+  3. **Calculate** — prerequisite checklist, "Run Calculation" button, result summary, excluded-orders download.
+  4. **Results** — comparison view (see below). Disabled until Calculate status is "Complete".
 
-     The UI should make it easy to add multiple locations under the same
-     provider. When a user types a provider_name that already exists in the
-     analysis, autosuggest it so locations get grouped correctly. A provider
-     with multiple warehouses shows a small "multi-node" indicator in the
-     warehouses list.
-  3. **Run Analysis** — button to trigger calculation, shows progress
-  4. **Results** — comparison view (see below)
+  Sidebar status indicators update live: Orders shows count or "Not uploaded"; Providers shows "N providers / M locations" or "None added"; Calculate shows "Needs inputs" / "Ready" / "Complete" / "Error"; Results shows "Available" or "Run calculate first".
+
+#### Providers tab
+
+The tab is named "Providers" in the UI. The underlying table is still `warehouses` — do not rename schema columns or API fields. The UI groups warehouses by `provider_name` and presents each group as a provider card.
+
+Each provider card contains:
+- **Rate card section** at the top — one upload zone per provider (drag/drop or click; CSV/Excel). Uploading fans out to all of the provider's locations client-side: one `POST /api/warehouses/[id]/rate-cards` per location, in parallel via `Promise.allSettled`. Partial failure (some locations succeeded, some failed) is surfaced explicitly — never silently swallowed. Re-uploading replaces the rate card across all locations via the same fan-out. After a successful upload, shows: filename, entry count, weight_unit_mode, and a "Preview" link that expands a small price table.
+- **Locations list** below the rate card — each location is inline-editable: location label, origin ZIP, dim weight toggle, dim factor (shown only when dim toggle is on), flat surcharge (displayed as dollars, stored as cents), optional notes.
+- **"+ Add location"** button at the bottom of the card. When a new location is added under an existing provider that already has a rate card in the analysis, the server copies the most recent rate card (and all its entries) to the new warehouse inside the same transaction as warehouse creation (`POST /api/analyses/[id]/warehouses`). If no sibling location has a rate card yet, no copy happens. This is transparent to the user — there is no toggle, checkbox, or "apply to all" affordance.
+- **"Delete provider"** action on the card header — confirms, then cascades through all of the provider's locations.
+
+There is no per-location rate card upload in the UI. The user experience is: rate cards are a provider thing. The schema supports per-warehouse rate cards for future per-location overrides (v2), but this is not exposed in v1.
+
+When adding a new provider, the user enters the provider name and the first location's fields in one step. Typing a provider name that already exists in the analysis autosuggets it, so the user can add another location to an existing provider without accidentally creating a duplicate.
 
 ### Results View
 
@@ -511,8 +537,8 @@ Order count is NOT a column. It is shown once in the header stats bar.
 #### Supporting Sections (below the summary table)
 
 - **Zone distribution chart** — Bar or stacked bar showing % of orders per zone per warehouse (Single-node) or per provider (Optimized, using the winning warehouse per order).
-- **Detailed breakdown** — Expandable table showing every order with the computed cost at each warehouse plus the optimized pair for each multi-node provider. Same shape as the per-order export (see Exports). This is the audit view: any single order can be inspected end-to-end.
-- **Export** — See the next section.
+- **Detailed breakdown** — Expandable table showing every order with the computed cost at each warehouse plus the optimized triple (Zone, Cost, Winning Location) for each multi-node provider. Same shape as the per-order export (see Exports). This is the audit view: any single order can be inspected end-to-end.
+- **Export** — See the next section. `ExportButtons` renders top-right of the Results View in a flex wrapper alongside the `HeaderStatsBar` (not inside the stats bar itself). The buttons are gated on `analysis.status === 'complete'` and show a per-click "Generating…" state during file generation.
 
 ### Exports / Downloads
 
@@ -551,7 +577,7 @@ The per-order file (or Per-Order Breakdown tab) is a wide table — one row per 
 1. **Order-level columns** (constant): `Order #`, `Actual Weight`, `Dims (L × W × H)`, `Dest ZIP`, `State`, `Billable Weight`, `Billable Unit`
 2. **Per-provider column groups**, each ordered consistently:
    - Single-location provider: `<Provider> — <Location> Zone`, `<Provider> — <Location> Cost`
-   - Multi-location provider: one pair of columns per location first, then the optimized pair at the end of that provider's group:
+   - Multi-location provider: one pair of columns per location first, then three optimized columns at the end of that provider's group:
      - `<Provider> — <Location 1> Zone`, `<Provider> — <Location 1> Cost`
      - `<Provider> — <Location 2> Zone`, `<Provider> — <Location 2> Cost`
      - ... (one pair per location)
@@ -569,7 +595,30 @@ Separate from the main exports, the tool offers a download of any orders exclude
 
 ### Share
 
-Generate a shareable read-only link (generates a token, stores in `Analysis.shareable_token`, serves a public results page). The public page reflects the same persisted state (view_mode, excluded_locations, projected_order_count, projected_period) as the user's own view of the analysis — so a link sent to a client renders the exact configuration the consultant committed to.
+A "Share" button in the Results View top-right generates a shareable read-only link. Clicking it:
+1. POSTs to `POST /api/analyses/[id]/share`, which calls `crypto.randomUUID()` server-side, writes the token to `analyses.shareable_token`, and returns `{ token, url }`.
+2. Copies the URL (`window.location.origin + '/share/' + token`) to the clipboard.
+3. Shows "Link copied!" for 3 seconds, then reverts to the Share/Revoke button pair.
+
+When a token already exists, "Revoke link" is shown alongside "Share." Revoking calls `DELETE /api/analyses/[id]/share`, which sets `shareable_token = null`. The old URL 404s immediately.
+
+**Public share page** (`app/share/[token]/page.tsx`) is a client component that fetches `GET /api/share/[token]` — a public, no-auth route that resolves the analysis by token and returns the same payload shape as `GET /api/analyses/[id]/results`. The page renders `ResultsContent` with `readonly={true}`:
+- No mode toggle (mode fixed from persisted `viewMode`)
+- No projected cost input (values shown as static text if set)
+- No checkboxes (excluded locations rendered as plain text)
+- No Export buttons, no Share/Revoke button
+- Analysis name as a page heading, small "Powered by 3PL Shipping Analyzer" footer
+
+If the token doesn't exist or was revoked: a clean 404 page ("Link not found — this link doesn't exist or has been revoked").
+
+**Security model:** token is UUID v4 (122 bits of randomness, unguessable). Revocation is instant. The tool is single-user so there is no concept of "wrong user seeing someone else's data." Documented in a comment in the route handler.
+
+**Component architecture:** `ResultsView` (the interactive view) and the share page both render `ResultsContent` (extracted from ResultsView), which accepts `readonly: boolean` and optional interaction callbacks. This avoids duplicating rendering logic. `ResultsView` owns data fetching + state; `ResultsContent` is pure rendering.
+
+**API routes for share:**
+- `POST /api/analyses/[id]/share` — generates/replaces token, returns `{ token, url }`. Regenerating always issues a new UUID (revokes old link). Safe to call multiple times.
+- `DELETE /api/analyses/[id]/share` — sets `shareable_token = null`.
+- `GET /api/share/[token]` — public, no auth. Returns same payload shape as results route. Returns 404 if token not found or was revoked.
 
 ---
 
@@ -579,6 +628,7 @@ These features are planned for later. v1 code should not block these additions.
 
 - **Multi-rate-card optimization:** A 3PL can have multiple rate cards (e.g., Ground, Priority). "Optimize" mode picks the cheapest rate card per order. Non-optimize mode uses a single selected rate card for all orders.
 - **Individual rate card selection mode:** User manually selects which rate card to use for a specific warehouse comparison (not auto-optimized, not all orders — pick one card).
+- **Rate card scoping:** Today rate cards are fanned out per provider (one upload applies to all locations; new locations inherit the copy). In v2, a specific warehouse may need an overriding rate card (e.g., a DC that negotiated a different tier). If this becomes a real use case, consider promoting rate cards to a shared `provider_rate_cards` entity with a per-warehouse override layer rather than reworking the fan-out logic.
 - **Advanced surcharge rules:** Instead of a flat adder, support conditional surcharges (e.g., residential surcharge only for certain ZIP ranges, oversized surcharges based on dims).
 - **Carrier-specific zone databases:** Separate zone tables for UPS, FedEx, USPS if zone mappings diverge significantly.
 - **Provider metadata / Provider table:** Promote `provider_name` from a flat string to a `Provider` foreign-key relationship with contract terms, contacts, historical performance, etc.
@@ -615,13 +665,31 @@ These features are planned for later. v1 code should not block these additions.
 │   │   └── [token]/
 │   │       └── page.tsx      # Public shareable results
 │   └── api/
+│       ├── _lib/
+│       │   ├── errors.ts                 # Standardized error shape and error codes
+│       │   ├── schemas.ts                # Zod request schemas
+│       │   ├── serializers.ts            # Response shaping utilities
+│       │   └── multipart.ts              # FormData → ParsedFile (CSV/Excel)
 │       ├── analyses/
+│       │   ├── route.ts                  # GET (list), POST (create)
+│       │   └── [id]/
+│       │       ├── route.ts              # GET, PATCH, DELETE
+│       │       ├── calculate/            # POST — run calculation
+│       │       ├── excluded-orders/      # GET — excluded order list
+│       │       ├── orders/               # GET (list), POST (upload)
+│       │       ├── share/                # POST — generate/refresh token; DELETE — revoke
+│       │       └── warehouses/           # POST — add location to analysis
+│       ├── share/
+│       │   └── [token]/
+│       │       └── route.ts              # GET — public share endpoint (no auth)
 │       ├── warehouses/
-│       ├── orders/
+│       │   └── [id]/
+│       │       ├── route.ts              # PATCH, DELETE
+│       │       ├── rate-cards/           # POST — upload rate card for a warehouse
+│       │       └── zones/                # POST — manual zone override upload
 │       ├── rate-cards/
-│       ├── zones/
-│       ├── calculate/
-│       └── export/           # Summary + per-order CSV/Excel generation
+│       │   └── [id]/
+│       │       └── route.ts              # GET (preview), DELETE
 ├── lib/
 │   ├── db/
 │   │   ├── schema.ts         # Drizzle schema definitions
@@ -643,7 +711,15 @@ These features are planned for later. v1 code should not block these additions.
 │   │   ├── summary-export.ts     # Builds summary rows + header block
 │   │   ├── per-order-export.ts   # Builds wide per-order table
 │   │   ├── csv-writer.ts
-│   │   └── xlsx-writer.ts        # SheetJS multi-tab workbook
+│   │   ├── xlsx-writer.ts        # SheetJS multi-tab workbook
+│   │   └── filename.ts           # Analysis name slugifier with analysis-<id> fallback
+│   ├── results/
+│   │   ├── derive-table.ts           # Pure derivation of summary table model (sort, tiebreak, winner)
+│   │   ├── derive-zone-distribution.ts  # Zone distribution by provider (Optimized) or warehouse (Single-node)
+│   │   ├── derive-per-order-table.ts # Column definitions + row data for per-order breakdown
+│   │   └── excluded-orders-csv.ts    # Shared excluded-orders CSV builder (used by Calculate tab + Results View)
+│   ├── hooks/
+│   │   └── useDebouncedPatch.ts      # 500ms debounced PATCH to /api/analyses/[id], flushes on unmount
 │   └── utils/
 │       └── zip.ts            # ZIP code normalization, etc.
 ├── components/
@@ -652,13 +728,18 @@ These features are planned for later. v1 code should not block these additions.
 │   ├── analysis/
 │   ├── upload/
 │   └── results/
-│       ├── HeaderStatsBar.tsx
-│       ├── ModeToggle.tsx
-│       ├── SummaryTable.tsx
-│       ├── ProviderRow.tsx             # Optimized-mode expandable row
-│       ├── LocationSubRow.tsx          # Checkbox + location detail
-│       ├── NodeUtilizationStrip.tsx    # Inline utilization summary
-│       └── ExportButtons.tsx
+│       ├── HeaderStatsBar.tsx            # Order count, mode toggle, projected cost input
+│       ├── ModeToggle.tsx                # Pill toggle (Optimized | Single-node)
+│       ├── SummaryTable.tsx              # Summary table with projected cost column
+│       ├── ProviderRow.tsx               # Collapsed/expanded provider row with utilization strip
+│       ├── LocationSubRow.tsx            # Checkbox sub-row, dimmed when excluded
+│       ├── NodeUtilizationStrip.tsx      # One-line percentage summary for expanded provider rows
+│       ├── ZoneDistributionChart.tsx     # Horizontal stacked bar chart (Recharts)
+│       ├── DetailedBreakdown.tsx         # Collapsible per-order audit table, sticky Order #, pagination
+│       ├── ExportButtons.tsx             # CSV + Excel download buttons
+│       ├── ShareButton.tsx               # Share/Revoke link button with clipboard copy + "Link copied!" state
+│       ├── ResultsContent.tsx            # Pure rendering component (readonly prop; used by ResultsView + share page)
+│       └── ResultsView.tsx               # Orchestrator; fetches matrix, owns all Results View state; renders ResultsContent
 ├── types/
 │   └── index.ts              # Shared TypeScript types
 ├── scripts/
@@ -671,7 +752,33 @@ These features are planned for later. v1 code should not block these additions.
 │   │   ├── rate-lookup.test.ts
 │   │   ├── optimized.test.ts       # Step 7: grouping, winner selection, utilization, edge cases
 │   │   └── integration.test.ts     # End-to-end calc with known data
-│   └── parsers/
+│   ├── parsers/
+│   ├── api/
+│   │   ├── routes.test.ts
+│   │   ├── results-route.test.ts
+│   │   ├── calculate-flow.test.ts
+│   │   ├── rate-card-fanout.test.ts
+│   │   ├── share.test.ts           # POST/DELETE /api/analyses/[id]/share, GET /api/share/[token]
+│   │   └── setup.ts
+│   ├── results/
+│   │   ├── derive-table.test.ts
+│   │   ├── derive-zone-distribution.test.ts
+│   │   └── derive-per-order-table.test.ts
+│   ├── export/
+│   │   ├── summary-export.test.ts
+│   │   ├── per-order-export.test.ts
+│   │   ├── csv-writer.test.ts
+│   │   ├── xlsx-writer.test.ts
+│   │   ├── filename.test.ts
+│   │   └── integration.test.ts
+│   ├── components/
+│   │   ├── SummaryTable.test.tsx
+│   │   ├── ExportButtons.test.tsx
+│   │   ├── ShareButton.test.tsx        # Share/Revoke button interactions (fetch mock + clipboard mock)
+│   │   └── ResultsReadonly.test.tsx    # readonly=true/false for SummaryTable + HeaderStatsBar
+│   ├── fixtures/
+│   ├── seed/
+│   └── setup-dom.ts
 ├── data/
 │   └── zone-seeds/           # Reserved for any manual zone overrides
 ├── db/
@@ -706,7 +813,7 @@ The calculation engine MUST have comprehensive tests. For every business logic f
   - Summary export in Single-node mode omits the Network Configurations block.
   - Per-order export in both modes has identical column structure.
   - Per-order Optimized columns respect current checkbox state (excluded locations can be columns, but are never winners).
-- **Integration test:** Take 10-15 orders from the sample spreadsheet provided, configure the same warehouse/rate card, and verify the tool produces the EXACT same costs as the spreadsheet. This is the acceptance test.
+- **Integration test:** `tests/engine/integration.test.ts` covers 12 orders against the Kase/Milwaukee/53154 warehouse with the Atomix Ground rate card (oz_then_lbs). The 6 orders in the Sample Data table below must match exactly; 4 additional orders cover oz_then_lbs edge cases (exactly 1.0 lb boundary, 15.6 oz rounding, small oz, zone 1 local); 2 orders test dim weight (dim wins, actual wins). All expected values are computed by hand — do NOT derive them by running the engine.
 
 ---
 

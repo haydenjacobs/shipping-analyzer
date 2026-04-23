@@ -1,133 +1,172 @@
+/**
+ * GET /api/analyses/[id]/results
+ *
+ * Returns the full OrderResult matrix plus the analysis + warehouse metadata
+ * needed to render the Results View. Step 7 (Optimized) is executed client-side
+ * over this matrix — the engine runs once at calculate time; the UI re-derives
+ * optimized aggregates on every checkbox toggle.
+ *
+ * Size tripwire: matrices larger than 500K cells (orders × warehouses) return
+ * 413 so v1 isn't silently responsible for multi-MB JSON blobs. If this fires
+ * for a real analysis we'll design pagination / streaming in v2.
+ */
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import {
   analyses,
+  warehouses,
   orders,
-  tpls,
-  locations,
   orderResults,
-  orderBestResults,
+  excludedOrders as excludedOrdersTable,
 } from '@/lib/db/schema'
-import { eq, inArray } from 'drizzle-orm'
-import type { TplSummary, LocationSummary } from '@/types'
+import { eq, inArray, sql } from 'drizzle-orm'
+import { apiError, notFound } from '../../../_lib/errors'
+import { serializeAnalysis } from '../../../_lib/serializers'
 
-/**
- * GET /api/analyses/:id/results
- * Reconstructs TplSummaries from stored order_best_results and order_results.
- * Returns the same shape as the POST /api/calculate response.
- */
-export async function GET(
-  _req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id: idStr } = await params
-  const id = parseInt(idStr)
+const MAX_MATRIX_CELLS = 500_000
 
-  const [analysis] = await db.select().from(analyses).where(eq(analyses.id, id))
-  if (!analysis) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+function parseId(raw: string) {
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
 
-  if (analysis.status !== 'complete') {
-    return NextResponse.json({ tplSummaries: [], includedOrders: 0, excludedOrders: 0, excluded: [], warnings: [] })
+export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const { id: rawId } = await ctx.params
+  const id = parseId(rawId)
+  if (id === null) return apiError('BAD_REQUEST', 'invalid id', 400)
+
+  const analysisRow = db.select().from(analyses).where(eq(analyses.id, id)).get()
+  if (!analysisRow) return notFound('Analysis')
+
+  if (analysisRow.status !== 'complete') {
+    return NextResponse.json(
+      { error: { code: 'NOT_CALCULATED', message: 'Run calculation first' } },
+      { status: 409 },
+    )
   }
 
-  const allOrders = await db.select().from(orders).where(eq(orders.analysisId, id))
-  if (allOrders.length === 0) {
-    return NextResponse.json({ tplSummaries: [], includedOrders: 0, excludedOrders: 0, excluded: [], warnings: [] })
+  const whRows = db.select().from(warehouses).where(eq(warehouses.analysisId, id)).all()
+
+  const orderCount = Number(
+    db
+      .select({ n: sql<number>`count(*)` })
+      .from(orders)
+      .where(eq(orders.analysisId, id))
+      .get()?.n ?? 0,
+  )
+
+  // Size guard. Approximation before hitting the big result table — if orders *
+  // warehouses already exceeds the cap, bail before doing a wide fetch.
+  if (orderCount * whRows.length > MAX_MATRIX_CELLS) {
+    return NextResponse.json(
+      {
+        error: {
+          code: 'MATRIX_TOO_LARGE',
+          message:
+            'This analysis is too large for the current Results View. Contact the developer.',
+        },
+      },
+      { status: 413 },
+    )
   }
 
-  const orderIds = allOrders.map(o => o.id)
-  const allTpls = await db.select().from(tpls).where(eq(tpls.analysisId, id))
-  if (allTpls.length === 0) {
-    return NextResponse.json({ tplSummaries: [], includedOrders: 0, excludedOrders: 0, excluded: [], warnings: [] })
-  }
+  // Included order IDs = orders for this analysis NOT in excluded_orders.
+  const orderRows = db
+    .select()
+    .from(orders)
+    .where(eq(orders.analysisId, id))
+    .all()
+  const orderIds = orderRows.map((r) => r.id)
 
-  const tplIds = allTpls.map(t => t.id)
-  const allLocations = await db.select().from(locations).where(inArray(locations.tplId, tplIds))
-  const bestResults = await db.select().from(orderBestResults).where(inArray(orderBestResults.orderId, orderIds))
-  const results = await db.select().from(orderResults).where(inArray(orderResults.orderId, orderIds))
+  const excludedRows =
+    orderIds.length === 0
+      ? []
+      : db
+          .select({ orderId: excludedOrdersTable.orderId })
+          .from(excludedOrdersTable)
+          .where(inArray(excludedOrdersTable.orderId, orderIds))
+          .all()
+  const excludedSet = new Set(excludedRows.map((r) => r.orderId))
+  const includedIds = orderIds.filter((oid) => !excludedSet.has(oid))
 
-  const tplSummaries: TplSummary[] = allTpls
-    .map(tpl => {
-      const tplBest = bestResults.filter(r => r.tplId === tpl.id)
-      const orderCount = tplBest.length
-      const totalCostCents = tplBest.reduce((s, r) => s + r.bestTotalCostCents, 0)
-      const avgCostCents = orderCount > 0 ? Math.round(totalCostCents / orderCount) : 0
+  const resultRows =
+    includedIds.length === 0
+      ? []
+      : db
+          .select({
+            orderId: orderResults.orderId,
+            warehouseId: orderResults.warehouseId,
+            zone: orderResults.zone,
+            totalCostCents: orderResults.totalCostCents,
+            billableWeightValue: orderResults.billableWeightValue,
+            billableWeightUnit: orderResults.billableWeightUnit,
+          })
+          .from(orderResults)
+          .where(inArray(orderResults.orderId, includedIds))
+          .all()
 
-      const zoneDistribution: Record<number, number> = {}
-      const zoneCosts: Record<number, number[]> = {}
-
-      for (const best of tplBest) {
-        const result = results.find(
-          r =>
-            r.orderId === best.orderId &&
-            r.locationId === best.bestLocationId &&
-            r.rateCardId === best.bestRateCardId &&
-            r.tplId === tpl.id
-        )
-        if (result?.zone != null) {
-          zoneDistribution[result.zone] = (zoneDistribution[result.zone] ?? 0) + 1
-          zoneCosts[result.zone] = [...(zoneCosts[result.zone] ?? []), best.bestTotalCostCents]
-        }
-      }
-
-      const avgCostByZone: Record<number, number> = {}
-      for (const [zone, costs] of Object.entries(zoneCosts)) {
-        avgCostByZone[Number(zone)] = Math.round(costs.reduce((s, c) => s + c, 0) / costs.length)
-      }
-
-      const tplLocations = allLocations.filter(l => l.tplId === tpl.id)
-      const locationSummaries: LocationSummary[] = tplLocations.map(loc => {
-        const locBest = tplBest.filter(r => r.bestLocationId === loc.id)
-        const locCount = locBest.length
-        const locTotal = locBest.reduce((s, r) => s + r.bestTotalCostCents, 0)
-        const locAvg = locCount > 0 ? Math.round(locTotal / locCount) : 0
-        const locZoneDist: Record<number, number> = {}
-        for (const best of locBest) {
-          const result = results.find(
-            r =>
-              r.orderId === best.orderId &&
-              r.locationId === loc.id &&
-              r.rateCardId === best.bestRateCardId &&
-              r.tplId === tpl.id
-          )
-          if (result?.zone != null) {
-            locZoneDist[result.zone] = (locZoneDist[result.zone] ?? 0) + 1
-          }
-        }
-        return {
-          locationId: loc.id,
-          locationName: loc.name,
-          originZip3: loc.originZip3,
-          orderCount: locCount,
-          totalCostCents: locTotal,
-          avgCostCents: locAvg,
-          zoneDistribution: locZoneDist,
-        }
-      })
-
-      return {
-        tplId: tpl.id,
-        tplName: tpl.name,
-        multiNodeEnabled: tpl.multiNodeEnabled,
-        orderCount,
-        totalCostCents,
-        avgCostCents,
-        zoneDistribution,
-        avgCostByZone,
-        locationSummaries,
-      }
+  // Group into the matrix shape: per-order, list of (warehouseId, zone, cost, billable weight).
+  const byOrder = new Map<number, {
+    warehouse_id: number
+    zone: number
+    total_cost_cents: number
+    billable_weight_value: number
+    billable_weight_unit: string
+  }[]>()
+  for (const r of resultRows) {
+    const list = byOrder.get(r.orderId) ?? []
+    list.push({
+      warehouse_id: r.warehouseId,
+      zone: r.zone,
+      total_cost_cents: r.totalCostCents,
+      billable_weight_value: r.billableWeightValue,
+      billable_weight_unit: r.billableWeightUnit,
     })
-    .sort((a, b) => a.avgCostCents - b.avgCostCents)
+    byOrder.set(r.orderId, list)
+  }
 
-  const includedOrderIds = new Set(bestResults.map(r => r.orderId))
-  const includedOrders = includedOrderIds.size
-  const excludedOrders = allOrders.length - includedOrders
+  const matrix = includedIds
+    .filter((oid) => byOrder.has(oid))
+    .map((oid) => ({ order_id: oid, results: byOrder.get(oid)! }))
+
+  // Include order details for the Detailed Breakdown table.
+  const includedSet = new Set(includedIds)
+  const ordersDetail = orderRows
+    .filter((o) => includedSet.has(o.id))
+    .map((o) => ({
+      id: o.id,
+      order_number: o.orderNumber,
+      actual_weight_lbs: o.actualWeightLbs,
+      height: o.height,
+      width: o.width,
+      length: o.length,
+      dest_zip: o.destZip,
+      state: o.state,
+    }))
+
+  const analysis = serializeAnalysis(analysisRow)
 
   return NextResponse.json({
-    tplSummaries,
-    includedOrders,
-    excludedOrders,
-    excluded: [],
-    warnings: [],
+    analysis: {
+      id: analysis.id,
+      name: analysis.name,
+      viewMode: analysis.viewMode,
+      excludedLocations: analysis.excludedLocations,
+      status: analysis.status,
+      projectedOrderCount: analysis.projectedOrderCount,
+      projectedPeriod: analysis.projectedPeriod,
+      shareableToken: analysis.shareableToken,
+    },
+    warehouses: whRows.map((w) => ({
+      id: w.id,
+      provider_name: w.providerName,
+      location_label: w.locationLabel,
+      origin_zip: w.originZip,
+      origin_zip3: w.originZip3,
+    })),
+    orders_included_count: matrix.length,
+    orders_excluded_count: excludedSet.size,
+    matrix,
+    orders: ordersDetail,
   })
 }

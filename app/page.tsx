@@ -126,7 +126,7 @@ export default function Dashboard() {
               className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-600 transition-colors"
             >
               <Link href={`/analysis/${a.id}`} className="block p-4 group">
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium text-gray-900 dark:text-gray-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
@@ -148,24 +148,21 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
+                  <button
+                    onClick={(e) => { e.preventDefault(); void deleteAnalysis(a.id) }}
+                    disabled={deletingId === a.id}
+                    className="text-gray-400 dark:text-gray-500 hover:text-red-500 dark:hover:text-red-400 disabled:opacity-50 transition-colors"
+                    title="Delete analysis"
+                  >
+                    {deletingId === a.id
+                      ? <span className="text-xs">…</span>
+                      : <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                        </svg>
+                    }
+                  </button>
                 </div>
               </Link>
-              <div className="px-4 pb-3 flex items-center gap-2 border-t border-gray-100 dark:border-gray-700 pt-2">
-                <Link
-                  href={a.status === 'complete' ? `/analysis/${a.id}/results` : `/analysis/${a.id}`}
-                  className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-                >
-                  Open
-                </Link>
-                <span className="flex-1" />
-                <button
-                  onClick={() => void deleteAnalysis(a.id)}
-                  disabled={deletingId === a.id}
-                  className="text-xs text-red-500 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 disabled:opacity-50"
-                >
-                  {deletingId === a.id ? 'Deleting…' : 'Delete'}
-                </button>
-              </div>
             </div>
           ))}
         </div>
