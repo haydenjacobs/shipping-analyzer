@@ -133,8 +133,6 @@ export function ProviderRateCardSection({ providerName, warehouses, rateCard, on
           <div className="text-sm">
             <span className="font-medium text-gray-800 dark:text-gray-200">{rateCard.name}</span>
             <span className="text-gray-400 dark:text-gray-500 mx-2">·</span>
-            <span className="text-gray-500 dark:text-gray-400">{modeLabel}</span>
-            <span className="text-gray-400 dark:text-gray-500 mx-2">·</span>
             <button
               onClick={togglePreview}
               className="text-blue-600 dark:text-blue-400 hover:underline"

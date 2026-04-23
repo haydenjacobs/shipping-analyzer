@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { rateCardEntries, rateCards } from '@/lib/db/schema'
-import { eq } from 'drizzle-orm'
+import { analyses, rateCardEntries, rateCards, warehouses } from '@/lib/db/schema'
+import { eq, sql } from 'drizzle-orm'
 import { apiError, notFound } from '../../_lib/errors'
 
 function parseId(raw: string) {
@@ -32,8 +32,20 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   const id = parseId(rawId)
   if (id === null) return apiError('BAD_REQUEST', 'invalid id', 400)
 
+  const rc = db.select({ warehouseId: rateCards.warehouseId }).from(rateCards).where(eq(rateCards.id, id)).get()
+  if (!rc) return notFound('RateCard')
+
+  const wh = db.select({ analysisId: warehouses.analysisId }).from(warehouses).where(eq(warehouses.id, rc.warehouseId)).get()
+
   const result = db.delete(rateCards).where(eq(rateCards.id, id)).returning({ id: rateCards.id }).all()
   if (result.length === 0) return notFound('RateCard')
   // ON DELETE CASCADE handles rate_card_entries and order_results.
+
+  if (wh) {
+    db.update(analyses)
+      .set({ status: 'draft', updatedAt: sql`CURRENT_TIMESTAMP` })
+      .where(eq(analyses.id, wh.analysisId))
+      .run()
+  }
   return NextResponse.json({ deleted: true })
 }

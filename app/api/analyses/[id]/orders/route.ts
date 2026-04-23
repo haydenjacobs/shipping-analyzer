@@ -110,6 +110,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return rows.length
   })()
 
+  db.update(analyses)
+    .set({ status: 'draft', updatedAt: sql`CURRENT_TIMESTAMP` })
+    .where(eq(analyses.id, id))
+    .run()
+
   return NextResponse.json({
     imported: inserted,
     failed: parseResult.errors.length,

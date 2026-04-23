@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db, sqlite } from '@/lib/db'
 import { analyses, warehouses, rateCards, rateCardEntries } from '@/lib/db/schema'
-import { and, desc, eq, inArray, ne } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm'
 import { warehouseCreateSchema } from '../../../_lib/schemas'
 import { apiError, notFound, zodErrorResponse } from '../../../_lib/errors'
 import { normalizeZip, getZip3, isValidZip5 } from '@/lib/utils/zip'
@@ -101,6 +101,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
         }
       }
     }
+
+    // Reset status so stale results aren't shown alongside the new warehouse.
+    db.update(analyses)
+      .set({ status: 'draft', updatedAt: sql`CURRENT_TIMESTAMP` })
+      .where(eq(analyses.id, analysisId))
+      .run()
 
     return newWh
   })()

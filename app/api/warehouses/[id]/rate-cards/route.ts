@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db, sqlite } from '@/lib/db'
-import { rateCardEntries, rateCards, warehouses } from '@/lib/db/schema'
-import { eq } from 'drizzle-orm'
+import { analyses, rateCardEntries, rateCards, warehouses } from '@/lib/db/schema'
+import { eq, sql } from 'drizzle-orm'
 import { apiError, notFound, zodErrorResponse } from '../../../_lib/errors'
 import { rateCardCreateSchema } from '../../../_lib/schemas'
 import { readUploadedFile, FileParseError, UnsupportedFileTypeError } from '../../../_lib/multipart'
@@ -75,7 +75,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const warehouseId = parseId(rawId)
   if (warehouseId === null) return apiError('BAD_REQUEST', 'invalid id', 400)
 
-  const wh = db.select({ id: warehouses.id }).from(warehouses).where(eq(warehouses.id, warehouseId)).get()
+  const wh = db.select({ id: warehouses.id, analysisId: warehouses.analysisId }).from(warehouses).where(eq(warehouses.id, warehouseId)).get()
   if (!wh) return notFound('Warehouse')
 
   let form: FormData
@@ -163,6 +163,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
     return rc
   })()
+
+  db.update(analyses)
+    .set({ status: 'draft', updatedAt: sql`CURRENT_TIMESTAMP` })
+    .where(eq(analyses.id, wh.analysisId))
+    .run()
 
   return NextResponse.json(
     {

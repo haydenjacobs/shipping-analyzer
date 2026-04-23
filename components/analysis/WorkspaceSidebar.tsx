@@ -54,12 +54,14 @@ const TABS: TabMeta[] = [
 ]
 
 export function WorkspaceSidebar({ analysis, activeTab, onTabChange }: Props) {
+  const resultsReady = analysis?.status === 'complete'
+
   return (
     <nav className="w-52 shrink-0 flex flex-col gap-1 pt-2">
       {TABS.map((tab) => {
         const isActive = tab.id === activeTab
         const isDisabled = tab.disabled?.(analysis) ?? false
-        const statusText = tab.statusLine(analysis)
+        const isResultsReady = tab.id === 'results' && resultsReady
 
         return (
           <button
@@ -73,12 +75,22 @@ export function WorkspaceSidebar({ analysis, activeTab, onTabChange }: Props) {
                 ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
                 : isDisabled
                   ? 'text-gray-300 dark:text-gray-600 cursor-not-allowed'
-                  : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800',
+                  : isResultsReady
+                    ? 'text-gray-700 dark:text-gray-300 hover:bg-emerald-50 dark:hover:bg-emerald-900/20'
+                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800',
             ].join(' ')}
           >
-            <div className={`text-sm font-medium ${isActive ? 'text-blue-700 dark:text-blue-300' : ''}`}>
-              {tab.label}
+            <div className="flex items-center justify-between gap-2">
+              <span className={`text-sm font-medium ${isActive ? 'text-blue-700 dark:text-blue-300' : isResultsReady ? 'text-emerald-600 dark:text-emerald-400' : ''}`}>
+                {tab.label}
+              </span>
+              {isResultsReady && !isActive && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+              )}
             </div>
+            {isResultsReady && !isActive && (
+              <p className="text-xs text-emerald-600 dark:text-emerald-500 mt-0.5">Ready to view</p>
+            )}
           </button>
         )
       })}

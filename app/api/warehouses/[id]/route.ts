@@ -1,10 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { warehouses } from '@/lib/db/schema'
-import { eq } from 'drizzle-orm'
+import { analyses, warehouses } from '@/lib/db/schema'
+import { eq, sql } from 'drizzle-orm'
 import { warehousePatchSchema } from '../../_lib/schemas'
 import { apiError, notFound, zodErrorResponse } from '../../_lib/errors'
 import { normalizeZip, getZip3, isValidZip5 } from '@/lib/utils/zip'
+
+function markAnalysisDraft(analysisId: number) {
+  db.update(analyses)
+    .set({ status: 'draft', updatedAt: sql`CURRENT_TIMESTAMP` })
+    .where(eq(analyses.id, analysisId))
+    .run()
+}
 
 function parseId(raw: string) {
   const id = Number(raw)
@@ -42,8 +49,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     patch.surchargeFlatCents = parsed.data.surcharge_flat_cents
   if (parsed.data.notes !== undefined) patch.notes = parsed.data.notes
 
+  const calcFields = ['origin_zip', 'dim_weight_enabled', 'dim_factor', 'surcharge_flat_cents'] as const
+  const affectsCalc = calcFields.some((f) => parsed.data[f] !== undefined)
+
+  const wh = db.select({ analysisId: warehouses.analysisId }).from(warehouses).where(eq(warehouses.id, id)).get()
+  if (!wh) return notFound('Warehouse')
+
   const result = db.update(warehouses).set(patch).where(eq(warehouses.id, id)).returning().all()
   if (result.length === 0) return notFound('Warehouse')
+
+  if (affectsCalc) markAnalysisDraft(wh.analysisId)
   return NextResponse.json(result[0])
 }
 
@@ -52,7 +67,12 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   const id = parseId(rawId)
   if (id === null) return apiError('BAD_REQUEST', 'invalid id', 400)
 
+  const wh = db.select({ analysisId: warehouses.analysisId }).from(warehouses).where(eq(warehouses.id, id)).get()
+  if (!wh) return notFound('Warehouse')
+
   const result = db.delete(warehouses).where(eq(warehouses.id, id)).returning({ id: warehouses.id }).all()
   if (result.length === 0) return notFound('Warehouse')
+
+  markAnalysisDraft(wh.analysisId)
   return NextResponse.json({ deleted: true })
 }
